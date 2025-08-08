@@ -32,14 +32,8 @@ setup(
     license='Apache License 2.0',
     install_requires=install_requires,
     packages=find_packages(),
-    entry_points={
-        'certbot.plugins': [
-            'dns-local = certbot_dns_local.auth:CertbotDNSAuthenticator'
-        ]
-    },
     classifiers=[
-        'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.10',
         'License :: OSI Approved :: Apache Software License',
         'Intended Audience :: System Administrators',
         'Topic :: Internet :: Name Service (DNS)',
@@ -47,5 +41,10 @@ setup(
         'Development Status :: 4 - Beta',
         'Environment :: Plugins',
         'Operating System :: POSIX :: Linux'
-    ]
+    ],
+    entry_points={
+        'certbot.plugins': [
+            'dns-local = certbot_dns_local.authenticator:Authenticator'
+        ]
+    },
 )
