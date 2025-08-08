@@ -6,15 +6,14 @@ import os
 import queue
 import socket
 import threading
-import typing
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional
 
 import dns
 import dns.message
 import dns.resolver
 from certbot import errors
 from certbot.plugins import dns_common
-from IPython import embed
+# from IPython import embed
 
 from .dnsutils import dns_challenge_server_ips
 
