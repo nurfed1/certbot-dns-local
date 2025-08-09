@@ -6,6 +6,7 @@ import os
 import queue
 import socket
 import threading
+import time
 from typing import Any, Callable, Optional
 
 import dns
@@ -102,65 +103,161 @@ class ProcolAgnosticNfqueue:
 
 
 class DNSAuthenticator(abc.ABC):
-    def __init__(self) -> None:
-        self.validations: dict[str, list[str]] = {}
+    def __init__(self, *, ttl: int = 5) -> None:
+        self.ttl = ttl
+
+        self.txt_records: dict[str, list[str]] = {}
+        self.caa_records: dict[str, list[str]] = {}
+
+        self.zone_apex: Optional[str] = None
+
+        self._soa = {
+            "mname": "ns1.example.",
+            "rname": "hostmaster.example.",
+            "refresh": 10800,
+            "retry": 300,
+            "expire": 604800,
+            "minimum": 300,
+        }
+        self._soa_serial = int(time.time())
+
         self.lock = threading.Lock()
 
-    def add_challenge(self, validation_name: str, validation: str) -> None:
-        key = validation_name.rstrip(".").lower()
-
-        with self.lock:
-            self.validations.setdefault(key, []).append(validation)
-
-    def _reply_from_data(self, data: bytes) -> Optional[bytes]:
-        try:
-            request = dns.message.from_wire(data)
-
-            # We only handle standard queries with at least one question
-            if not request.question:
-                return None
-
-            q = request.question[0]
-
-            if q.rdclass != dns.rdataclass.IN or q.rdtype != dns.rdatatype.TXT:
-                return None
-
-            # Normalize name
-            qname_str = q.name.to_text(omit_final_dot=True).lower()
-
-            with self.lock:
-                txt_values = self.validations.get(qname_str)
-
-            if not txt_values:
-                return None
-
-            # Build response
-            response = dns.message.make_response(request)
-            response.flags |= (
-                dns.flags.AA | dns.flags.RA
-            )  # authoritative + recursion available
-
-            rrset = dns.rrset.RRset(q.name, dns.rdataclass.IN, dns.rdatatype.TXT)
-            for txt in txt_values:
-                rrset.add(
-                    dns.rdata.from_text(
-                        dns.rdataclass.IN, dns.rdatatype.TXT, f'"{txt}"'
-                    )
-                )
-
-            response.answer.append(rrset)
-            return response.to_wire()
-
-        except Exception:
-            return None
+    # -------------------------- public API --------------------------
 
     @abc.abstractmethod
     def start(self):
         pass
 
     def stop(self):
-        self.validations.clear()
+        self.txt_records.clear()
 
+    def add_txt_record(self, name: str, value: str) -> None:
+        key = name.rstrip(".").lower()
+
+        with self.lock:
+            self.txt_records.setdefault(key, []).append(value)
+
+    def add_caa_record(self, name: str, value: str) -> None:
+        key = name.rstrip(".").lower()
+
+        with self.lock:
+            self.caa_records.setdefault(key, []).append(value)
+
+    # --------------------- top-level reply entry --------------------
+
+    def _reply_from_data(self, data: bytes) -> Optional[bytes]:
+        try:
+            req, qname, qname_str, rdclass, rdtype = self._parse_request(data)
+        except ValueError:
+            return None
+
+        try:
+            # print(f"DNS query name={qname_str} type={dns.rdatatype.to_text(rdtype)}")
+
+            if rdclass == dns.rdataclass.IN and rdtype == dns.rdatatype.TXT:
+                return self._handle_txt(req, qname, qname_str)
+
+            if rdclass == dns.rdataclass.IN and rdtype == dns.rdatatype.CAA:
+                return self._handle_caa(req, qname, qname_str)
+        except Exception as e:
+            print(e)
+
+        return None
+        # return self._nodata_with_soa(req, self._zone_owner(qname))
+
+    # ------------------------ helpers: parsing ----------------------
+
+    def _parse_request(self, data: bytes):
+        req = dns.message.from_wire(data)
+
+        if not req.question:
+            raise ValueError("no question")
+
+        q = req.question[0]
+        qname: dns.name.Name = q.name
+        qname_str = qname.to_text(omit_final_dot=True).lower()
+        rdclass = q.rdclass
+        rdtype = q.rdtype
+
+        return req, qname, qname_str, rdclass, rdtype
+
+    def _zone_owner(self, qname: dns.name.Name) -> dns.name.Name:
+        # print(f"owner: {qname}")
+        if self.zone_apex:
+            return dns.name.from_text(self.zone_apex)
+        return qname
+
+    # ---------------------- helpers: builders -----------------------
+
+    def _base_response(self, req: dns.message.Message, *, aa: bool = True, ra: bool = True) -> dns.message.Message:
+        resp = dns.message.make_response(req)
+        if aa:
+            resp.flags |= dns.flags.AA
+        if ra:
+            resp.flags |= dns.flags.RA
+        return resp
+
+    def _make_rrset(self, owner: dns.name.Name, rdatatype: dns.rdatatype, values: list[str]) -> dns.rrset.RRset:
+        rr = dns.rrset.RRset(owner, dns.rdataclass.IN, rdatatype)
+        rr.ttl = self.ttl
+        for v in values:
+            if rdatatype == dns.rdatatype.TXT:
+                v = f'"{v}"'
+            rr.add(dns.rdata.from_text(dns.rdataclass.IN, rdatatype, v))
+        return rr
+
+    def _soa_rrset(self, owner: dns.name.Name) -> dns.rrset.RRset:
+        # Ensure dots
+        mname = self._soa["mname"]
+        rname = self._soa["rname"]
+        if not isinstance(mname, str) or not isinstance(rname, str):
+            raise ValueError("SOA mname/rname must be strings")
+
+        if not mname.endswith("."):
+            mname += "."
+
+        if not rname.endswith("."):
+            rname += "."
+
+        # Bump serial
+        self._soa_serial += 1
+        txt = f"{mname} {rname} {self._soa_serial} {int(self._soa['refresh'])} {int(self._soa['retry'])} {int(self._soa['expire'])} {int(self._soa['minimum'])}"
+        rr = dns.rrset.RRset(owner, dns.rdataclass.IN, dns.rdatatype.SOA)
+        rr.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.SOA, txt))
+        return rr
+
+    def _nodata_with_soa(self, req: dns.message.Message, zone_owner: dns.name.Name) -> bytes:
+        resp = self._base_response(req, aa=True, ra=False)
+        resp.authority.append(self._soa_rrset(zone_owner))
+        return resp.to_wire()
+
+    # -------------------- helpers: per-type handlers ----------------
+
+    def _handle_txt(self, req: dns.message.Message, qname: dns.name.Name, qname_str: str) -> Optional[bytes]:
+        with self.lock:
+            values = self.txt_records.get(qname_str, [])
+
+        if not values:
+            # print(f"No value TXT {qname}")
+            # return self._nodata_with_soa(req, self._zone_owner(qname))
+            return None
+
+        resp = self._base_response(req, aa=True, ra=True)
+        resp.answer.append(self._make_rrset(qname, dns.rdatatype.TXT, values))
+        return resp.to_wire()
+
+    def _handle_caa(self, req: dns.message.Message, qname: dns.name.Name, qname_str: str) -> Optional[bytes]:
+        with self.lock:
+            lines = self.caa_records.get(qname_str, [])
+
+        if not lines:
+            # print(f"No value CAA {qname}")
+            return self._nodata_with_soa(req, self._zone_owner(qname))
+
+        resp = self._base_response(req, aa=True, ra=False)
+        resp.answer.append(self._make_rrset(qname, dns.rdatatype.CAA, lines))
+        return resp.to_wire()
 
 def _send_raw_udp_packet(src_addr, dst_addr, src_port, dst_port, payload, ip_layer):
     s = socket.socket(
@@ -343,7 +440,6 @@ class ServerAuthenticator(DNSAuthenticator):
 
         while not self.stop_event.is_set():
             try:
-                embed()
                 data, addr = self.socket.recvfrom(0xFFFF)
                 self.queue.put((data, addr))
             except Exception:
@@ -407,7 +503,7 @@ class Authenticator(dns_common.DNSAuthenticator):
 
     @classmethod
     def add_parser_arguments(
-        cls, add: Callable[..., None], default_propagation_seconds: int = 0
+        cls, add: Callable[..., None], default_propagation_seconds: int = 10
     ) -> None:
         super().add_parser_arguments(add, default_propagation_seconds)
         add(
@@ -497,7 +593,8 @@ class Authenticator(dns_common.DNSAuthenticator):
         if self.authenticator is None:
             self.authenticator = self._make_authenticator(domain)
 
-        self.authenticator.add_challenge(validation_name, validation)
+        self.authenticator.add_txt_record(validation_name, validation)
+        self.authenticator.add_caa_record(domain, '0 issue "letsencrypt.org"')
         if not self.authenticator_started:
             self.authenticator.start()
             self.authenticator_started = True

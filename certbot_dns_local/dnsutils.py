@@ -49,7 +49,7 @@ def dns_challenge_server_ips(domain):
             ns_ips = nameserver_ips(ns_domain)
             if len(ns_ips) != 0:
                 break
-        except dns.resolver.NXDOMAIN:
+        except (dns.resolver.NXDOMAIN, DNSException):  # TODO: remove DNSException?
             pass
         ns_domain = ".".join(ns_domain.split(".")[1:])  # Drop the first label
 
